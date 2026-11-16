@@ -2311,11 +2311,12 @@ function AllSessions({ compact = false }) {
             glow=${moved === session.id && group.slot !== "needs"}
             ownCall=${
                 session.approval !== undefined &&
-                server?.approvalRule === "others" &&
                 me?.role !== "owner" &&
-                // Nobody known to have asked is not someone else: the server leaves that one to the owner.
-                (session.approval.requestedBy === undefined ||
-                    session.approval.requestedBy === me?.id)
+                (session.approval.ownerOnly === true ||
+                    (server?.approvalRule === "others" &&
+                        // Nobody known to have asked is not someone else: the server leaves that one to the owner.
+                        (session.approval.requestedBy === undefined ||
+                            session.approval.requestedBy === me?.id)))
             }
             onReview=${onReview}
             onAnswer=${onAnswer}

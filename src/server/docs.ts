@@ -344,7 +344,14 @@ export type SubagentRecord = {
 };
 
 /** The exact reply-hook receipt that started work later reported to a hook. */
-export type ReplyOrigin = { hookId: string; key: string; request: string; followUp: true };
+export type ReplyOrigin = {
+    hookId: string;
+    key: string;
+    request: string;
+    followUp: true;
+    /** Present only for a fresh protocol-3 root receipt. */
+    protocol?: 3;
+};
 /** The complete hook roots of one model run. Their stored order is stable. */
 export type ReplyOrigins = ReplyOrigin[];
 
@@ -894,6 +901,21 @@ export type Hook = {
      * Where each answer to a post goes, and the secret that signs it (`reply-hooks.ts`). Absent: the hook only takes
      * posts. Set by the person who made it.
      */
+    /** Protocol 3 private staged inbound media. Bytes stay in the target upload directory. */
+    media?: Record<
+        string,
+        {
+            handle: string;
+            request: string;
+            target: number;
+            file: { id: string; name: string; mime: string; size: number; sha256: string };
+            path: string;
+            /** The exact root receipt that consumed this handle. */
+            boundRequest?: string;
+            /** SHA-256 of the raw hook JSON body that bound this handle. */
+            bodyHash?: string;
+        }
+    >;
     reply?: {
         url: string;
         secret: string;
@@ -903,14 +925,60 @@ export type Hook = {
             {
                 request: string;
                 submissionRequest: string;
+                /** SHA-256 of the authenticated raw hook body. */
+                bodyHash?: string;
+                /** Ordered protocol-3 handles bound in this root receipt. */
+                attachments?: { handles: string[]; fingerprint: string };
+                /** Protocol-3 owner approval controls, durable before each callback attempt. */
+                controls?: Record<
+                    string,
+                    {
+                        file: {
+                            id: string;
+                            name: string;
+                            mime: string;
+                            size: number;
+                            sha256: string;
+                        };
+                        status: "awaiting-file-approval" | "file-approval-resolved";
+                        acknowledged?: true;
+                        attempts: number;
+                        nextAt: number;
+                        inactive?: true;
+                    }
+                >;
                 /** A derived receipt's root receipt key. Absent for a webhook's original receipt. */
                 root?: string;
                 /** The authenticated v2 capability of a root, or a derived receipt that inherited it. */
                 followUp?: true;
+                /** Set only when a fresh root authenticated protocol 3. */
+                protocol?: 3;
                 /** The stable order of replies for one original bridge request. */
                 sequence?: number;
                 done?: boolean;
-                pending?: { entry: string; text: string; attempts: number; nextAt: number };
+                pending?: {
+                    entry: string;
+                    text: string;
+                    attempts: number;
+                    nextAt: number;
+                    /** Frozen before the first protocol-3 network effect. */
+                    media?: {
+                        conversation: number;
+                        root: string;
+                        derived: boolean;
+                        files: {
+                            file: {
+                                id: string;
+                                name: string;
+                                mime: string;
+                                size: number;
+                                sha256: string;
+                            };
+                            path: string;
+                            uploaded?: true;
+                        }[];
+                    };
+                };
             }
         >;
         /** Legacy uncorrelated state. Kept for stored-data compatibility; new delivery ignores it. */
@@ -934,9 +1002,44 @@ export type Hook = {
 };
 
 /** Every webhook, by id. */
+/** Immutable approved reply media. A manifest names one exact tool call and one exact protocol-3 root. */
+export type ReplyMediaManifest = {
+    hookId: string;
+    root: string;
+    request: string;
+    conversation: string;
+    task: string;
+    /** Calling generation. The SDK hands a logical run to later conversation-owned generations. */
+    modelTask: string;
+    /** Exact active input requests at approval registration, not every task in a root lineage. */
+    submissions: string[];
+    /** Claimed atomically with the immutable terminal upload plan. Never reassigned. */
+    entry?: string;
+    call: string;
+    file: { id: string; name: string; mime: string; size: number; sha256: string };
+    path: string;
+};
+
+export const ReplyMediaManifestsDoc = defineDoc<{ items: Record<string, ReplyMediaManifest> }>({
+    kind: "pocket.reply-media-manifests",
+    version: 1,
+    ...rebased,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    initial: () => ({ items: {} }),
+});
+
 export const HooksDoc = defineDoc<{ items: Record<string, Hook> }>({
     kind: "pocket.hooks",
-    version: 1,
+    version: 2,
+    migrate(value, fromVersion) {
+        if (fromVersion !== 1) {
+            throw new Error("Unsupported webhook document version");
+        }
+
+        return value as { items: Record<string, Hook> };
+    },
     ...rebased,
     scope: "session",
     initial: () => ({ items: {} }),

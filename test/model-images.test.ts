@@ -3,6 +3,7 @@ import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { deflateSync } from "node:zlib";
 import { forModel, imageWork, modelImage, prepareModelImage } from "../src/server/model-images.ts";
 import { heicToJpeg } from "../src/server/heic.ts";
 
@@ -15,6 +16,49 @@ const BLUE = Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAD0lEQVR4nGNgYPgPRmAKABf2A/1+6zfzAAAAAElFTkSuQmCC",
     "base64",
 );
+
+function crc32(bytes: Uint8Array): number {
+    let crc = 0xffffffff;
+
+    for (const byte of bytes) {
+        crc ^= byte;
+
+        for (let bit = 0; bit < 8; bit += 1) {
+            crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+        }
+    }
+
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+function chunk(type: string, data: Buffer): Buffer {
+    const name = Buffer.from(type, "latin1");
+    const output = Buffer.alloc(12 + data.length);
+
+    output.writeUInt32BE(data.length, 0);
+    name.copy(output, 4);
+    data.copy(output, 8);
+    output.writeUInt32BE(crc32(Buffer.concat([name, data])), 8 + data.length);
+
+    return output;
+}
+
+function png(width: number, height: number): Buffer {
+    const header = Buffer.alloc(13);
+    const raw = Buffer.alloc(height * (1 + width * 4));
+
+    header.writeUInt32BE(width, 0);
+    header.writeUInt32BE(height, 4);
+    header[8] = 8;
+    header[9] = 6;
+
+    return Buffer.concat([
+        Buffer.from("89504e470d0a1a0a", "hex"),
+        chunk("IHDR", header),
+        chunk("IDAT", deflateSync(raw)),
+        chunk("IEND", Buffer.alloc(0)),
+    ]);
+}
 
 test("an image prepared at upload is the one a message sends, without making it again", async () => {
     const folder = mkdtempSync(join(tmpdir(), "model-images-"));
@@ -53,7 +97,66 @@ test("an image whose file changed after its upload is read again", async () => {
     }
 });
 
-test("uploads make two images at a time, and wait at most 24 deep", async () => {
+test("a rejected pixel bomb remains an ordinary file attachment", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "model-images-"));
+
+    try {
+        const path = join(folder, "too-large.png");
+        const bomb = Buffer.from(PNG);
+
+        bomb.writeUInt32BE(5000, 16);
+        bomb.writeUInt32BE(5000, 20);
+        writeFileSync(path, bomb);
+        await assert.rejects(modelImage(path, "image/png"), /too many pixels/);
+        assert.deepEqual(
+            readFileSync(path),
+            bomb,
+            "inspection must not replace the uploaded attachment",
+        );
+    } finally {
+        rmSync(folder, { recursive: true, force: true });
+    }
+});
+
+test("the inspected container type, not the declared type, reaches the model", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "model-images-"));
+
+    try {
+        const path = join(folder, "wrong-name.jpg");
+
+        writeFileSync(path, PNG);
+        const made = await modelImage(path, "image/jpeg");
+
+        assert.equal(made.image.mimeType, "image/png");
+        assert.equal(made.note, "[Image: shown to you as PNG.]");
+        assert.deepEqual(readFileSync(path), PNG);
+    } finally {
+        rmSync(folder, { recursive: true, force: true });
+    }
+});
+
+test("ordinary image resize runs after inspection and leaves the attachment unchanged", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "model-images-"));
+
+    try {
+        const path = join(folder, "wide.png");
+        const original = png(2001, 1);
+
+        writeFileSync(path, original);
+        const made = await modelImage(path, "image/png");
+
+        assert.equal(made.image.mimeType, "image/png");
+        assert.equal(
+            made.note,
+            "[Image: original 2001x1, displayed at 2000x1. Multiply coordinates by 1.00 to map to original image.]",
+        );
+        assert.deepEqual(readFileSync(path), original);
+    } finally {
+        rmSync(folder, { recursive: true, force: true });
+    }
+});
+
+test("uploads make one image at a time, and wait at most 24 deep", async () => {
     const folder = mkdtempSync(join(tmpdir(), "model-images-"));
 
     try {
@@ -68,7 +171,7 @@ test("uploads make two images at a time, and wait at most 24 deep", async () => 
             prepareModelImage(path, "image/png", PNG.length);
         }
 
-        assert.deepEqual(imageWork(), { running: 2, waiting: 24 });
+        assert.deepEqual(imageWork(), { running: 1, waiting: 24 });
         await Promise.all(paths.map((path) => modelImage(path, "image/png")));
         assert.deepEqual(imageWork(), { running: 0, waiting: 0 });
     } finally {

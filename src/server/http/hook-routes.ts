@@ -32,15 +32,31 @@ export async function hookRoute(
     response: ServerResponse,
     id: string,
     secret: string | undefined,
+    action?: string,
 ): Promise<void> {
+    if (action === "capabilities") {
+        if (request.method !== "GET") {
+            response.setHeader("allow", "GET");
+
+            throw new HttpError(405, "Capabilities take GET.");
+        }
+
+        await app.hooks.capabilities(id, secret, request.headers);
+
+        return json(response, 200, { version: 3, maxFileBytes: 20 * 1024 * 1024 });
+    }
+
     if (request.method !== "POST") {
         response.setHeader("allow", "POST");
 
         throw new HttpError(405, "Webhooks take POST.");
     }
 
+    const upload = action === "upload";
+    const limit = upload ? 20 * 1024 * 1024 : MAX_POST;
+
     // Too big is too big, whether or not the hook is there: the answer says nothing about which ids exist.
-    if (Number(request.headers["content-length"] ?? 0) > MAX_POST) {
+    if (Number(request.headers["content-length"] ?? 0) > limit) {
         throw new HttpError(413, "Request too large");
     }
 
@@ -63,7 +79,7 @@ export async function hookRoute(
     );
 
     try {
-        body = await readBody(request, MAX_POST);
+        body = await readBody(request, limit);
     } catch (error) {
         // A sender that hung up is not the server's error: no stack in the log for it.
         if (error instanceof HttpError) {
@@ -81,6 +97,18 @@ export async function hookRoute(
         } else {
             readingBy.delete(id);
         }
+    }
+
+    if (upload) {
+        const requestId = Array.isArray(request.headers["idempotency-key"])
+            ? request.headers["idempotency-key"][0]
+            : request.headers["idempotency-key"];
+
+        return json(
+            response,
+            200,
+            await app.hooks.upload(id, secret, request.headers, requestId, body),
+        );
     }
 
     // `deliver` reads the authenticated `X-Pocket-Reply-Protocol` capability from these unchanged headers.
