@@ -1282,6 +1282,7 @@ export class Room {
                     ...(request.requestedBy === undefined
                         ? {}
                         : { requestedBy: request.requestedBy }),
+                    ...(request.ownerOnly === true ? { ownerOnly: true as const } : {}),
                     ...(request.form === undefined ? {} : { form: true as const }),
                 })),
         };

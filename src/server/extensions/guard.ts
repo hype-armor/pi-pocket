@@ -5,6 +5,7 @@
  */
 import { AgentDoc, defineExtension, hook, ToolTask } from "@earendil-works/pi-durable";
 import type { ApprovalAnswer, PocketHost } from "../host.ts";
+import { join } from "node:path";
 
 function oneLine(text: string, max = 200): string {
     const flat = text.trim().replace(/[\r\n]+/g, " ");
@@ -19,10 +20,32 @@ export default function createGuard(host: PocketHost) {
             hook(ToolTask, {
                 beforeTool: async (call, api, context) => {
                     const agent = await api.snapshot(AgentDoc, api.conversationId, context);
-                    const cwd = agent?.cwd ?? process.cwd();
+                    const args = call.arguments as Record<string, unknown>;
+                    const exporting = call.name === "share_reply_file";
+                    const savedScope = exporting
+                        ? await api.memo<{ cwd: string; name: string }>(
+                              "pocket.reply-media.guard",
+                              context,
+                          )
+                        : undefined;
+                    const cwd = savedScope?.cwd ?? agent?.cwd ?? process.cwd();
+                    const scope =
+                        exporting && typeof args.path === "string"
+                            ? { cwd, name: args.path }
+                            : undefined;
                     const judged = await host.guard.judge(
                         call.name,
-                        call.arguments as Record<string, unknown>,
+                        scope === undefined
+                            ? args
+                            : {
+                                  ...args,
+                                  path: join(
+                                      cwd,
+                                      ".pi-chat-exports",
+                                      String(api.conversationId),
+                                      scope.name,
+                                  ),
+                              },
                         cwd,
                     );
 
@@ -37,6 +60,10 @@ export default function createGuard(host: PocketHost) {
                             : "";
 
                     if (decision.action === "allow") {
+                        if (scope !== undefined) {
+                            await api.memo("pocket.reply-media.guard", scope, context);
+                        }
+
                         return undefined;
                     }
 
@@ -66,6 +93,10 @@ export default function createGuard(host: PocketHost) {
                         );
 
                         answer = await api.memo<ApprovalAnswer>("pocket.approval", asked, context);
+                    }
+
+                    if (answer.allow && scope !== undefined) {
+                        await api.memo("pocket.reply-media.guard", scope, context);
                     }
 
                     return answer.allow

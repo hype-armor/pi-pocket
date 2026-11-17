@@ -11,6 +11,17 @@ Pi Pocket is often edited from inside itself, while it runs. [docs/map.md](docs/
 - Document kinds in `src/server/docs.ts` are stored data. Do not rename them, or change their scope, history, or fork settings: Pi Durable checks those against what is stored.
 - Durable task checkpoints persist across restarts. When adding phases, bump the task version and migrate supported older checkpoints. Older definitions block newer stored versions.
 - Reply-hook follow-ups require a fresh authenticated protocol-2 capability and exact stored submission origins. Never infer a recipient from the latest session answer, a requester ID, or task ownership alone. Reserve derived receipts before notification admission; defer at capacity rather than dropping delivery.
+- Protocol-3 reply files require normal Guard approval of the actual export path and owner-only approval
+  of each hash-pinned copy. Keep the 20 MiB/file and 4 files/40 MiB/message limits. Never infer files
+  from Markdown or tool output. Legacy protocol-1/2 roots cannot acquire media authority.
+- The SDK hands a logical run between conversation-owned generation tasks. At registration, record
+  exact active input request IDs. Bind a manifest to the SDK submission's immutable answer and freeze
+  its upload plan atomically. A generation ancestor is not terminal-answer authority.
+- Inspect actual image containers before decode. Keep ordinary image processing serialized, with
+  the 16-million-pixel cap and worker timeout. Worker threads share process RSS; V8 heap limits do not
+  cap WebAssembly or native memory. Rejected images must remain usable file attachments. Validate
+  the exact image bytes returned by Durable's `read` tool through the same bounded pipeline before
+  they enter the transcript; never reopen a mutable path after inspection.
 - The server is plain TypeScript run by Node's type stripping: only erasable syntax (no enums, no parameter properties, no namespaces). Imports use `.ts` extensions.
 - Code style is Prettier (`.prettierrc.json`: 4 spaces, 100 columns) plus ESLint's layout rules (`eslint.config.js`): braces on every `if` and loop, and a blank line after declarations, around blocks, and before `return` and `throw`. Run `npm run format` after editing. Prettier leaves the markup in `html` templates alone, so lay it out by hand the same way: 4 spaces per level, and a tag that runs past 100 columns gets one attribute per line and its children on their own lines. In htm a line break is not a space: break only where there is no space, or between tags, never inside running text.
 - Run `npm run check`, `npm run lint`, and `npm test` after server changes.

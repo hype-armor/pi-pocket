@@ -76,7 +76,7 @@ export interface ToolJudgement {
 }
 
 const SHELL_TOOLS = new Set(["bash", "background"]);
-const FILE_TOOLS = new Set(["write", "edit"]);
+const FILE_TOOLS = new Set(["write", "edit", "share_reply_file"]);
 
 export class LancetGuard {
     readonly directory: string | undefined;

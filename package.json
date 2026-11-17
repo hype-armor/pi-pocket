@@ -61,6 +61,7 @@
         "@earendil-works/pi-durable": "1.5.2",
         "@earendil-works/pi-mcp": "1.5.2",
         "@earendil-works/pi-schema": "1.5.2",
+        "@silvia-odwyer/photon-node": "0.3.4",
         "dompurify": "^3.4.17",
         "heic-convert": "^2.1.0",
         "htm": "^3.1.1",

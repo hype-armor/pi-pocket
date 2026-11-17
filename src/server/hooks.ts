@@ -10,6 +10,8 @@
  * service can reach this server: through a tunnel or a public address. Hooks run while the triggers extension is on.
  */
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
@@ -23,6 +25,15 @@ import { attribute, clip, defang } from "./fence.ts";
 import { BRANCH_EVENTS, canWrite, MAY_WRITE, parseRepo } from "./github.ts";
 import { clientKey, requestFor } from "./requests.ts";
 import { TRIGGERS_EXTENSION } from "./watches.ts";
+import {
+    decodeDescriptor,
+    descriptor,
+    handle as newHandle,
+    hashFile,
+    MAX_MEDIA_FILE,
+    MAX_MEDIA_FILES,
+    MAX_MEDIA_TOTAL,
+} from "./reply-media.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -426,6 +437,82 @@ export class Hooks {
     /** Whether hooks take posts: the triggers extension is on. */
     get running(): boolean {
         return this.#app.loader.extensionNames().includes(TRIGGERS_EXTENSION);
+    }
+
+    /** Protocol 3 is available only on unsigned private hook routes. */
+    async capabilities(
+        id: string,
+        secret: string | undefined,
+        headers: Post["headers"],
+    ): Promise<void> {
+        await this.precheck(id, secret, headers);
+    }
+
+    /** Store authenticated protocol-3 bytes before the logical hook post binds them. */
+    async upload(
+        id: string,
+        secret: string | undefined,
+        headers: Post["headers"],
+        request: string | undefined,
+        bytes: Buffer,
+    ): Promise<{ handle: string }> {
+        await this.precheck(id, secret, headers);
+        const attachmentHeader = Array.isArray(headers["x-pocket-attachment"])
+            ? headers["x-pocket-attachment"][0]
+            : headers["x-pocket-attachment"];
+        const file = decodeDescriptor(attachmentHeader);
+
+        if (
+            request === undefined ||
+            request.length === 0 ||
+            request.length > 256 ||
+            bytes.length !== file.size ||
+            hashFile(bytes) !== file.sha256
+        ) {
+            throw new HttpError(400, "Attachment bytes do not match the descriptor");
+        }
+
+        const hook = (await this.#all()).find((each) => each.id === id)!;
+
+        if (hook.signed === true || bytes.length > MAX_MEDIA_FILE) {
+            throw new HttpError(400, "This hook cannot upload attachments");
+        }
+
+        const existing = Object.values(hook.media ?? {}).find(
+            (item) => item.request === request && item.file.id === file.id,
+        );
+
+        if (existing !== undefined) {
+            if (JSON.stringify(existing.file) !== JSON.stringify(file)) {
+                throw new HttpError(409, "Attachment upload conflicts with the existing file");
+            }
+
+            return { handle: existing.handle };
+        }
+
+        const directory = join(
+            this.#app.workspace.uploadDirectory(hook.target as ConversationId),
+            "hook-media",
+        );
+
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        const path = join(directory, `${newHandle()}-${file.name}`);
+
+        await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
+        const issued = newHandle();
+
+        await this.#app.harness.commit(async (tx) => {
+            const current = (await tx.doc(HooksDoc)).items[id];
+
+            if (current === undefined || current.target !== hook.target) {
+                throw new HttpError(404, "Not found");
+            }
+
+            current.media ??= {};
+            current.media[issued] = { handle: issued, request, target: current.target, file, path };
+        }, context);
+
+        return { handle: issued };
     }
 
     async #all(): Promise<Hook[]> {
@@ -903,6 +990,37 @@ export class Hooks {
         }
 
         const content = contentOf(post);
+        // Protocol 3 accepts opaque handles only. Paths and URLs never cross this boundary.
+        const requestedHandles =
+            content.json !== null &&
+            typeof content.json === "object" &&
+            !Array.isArray(content.json)
+                ? (content.json as { attachments?: unknown }).attachments
+                : undefined;
+        const handles =
+            requestedHandles === undefined
+                ? []
+                : Array.isArray(requestedHandles) &&
+                    requestedHandles.every(
+                        (item) =>
+                            item !== null &&
+                            typeof item === "object" &&
+                            typeof (item as { handle?: unknown }).handle === "string",
+                    )
+                  ? requestedHandles.map((item) => (item as { handle: string }).handle)
+                  : (() => {
+                        throw new HttpError(400, "Attachments must contain upload handles");
+                    })();
+        const replyProtocol = header(post, "x-pocket-reply-protocol");
+
+        if (
+            handles.length > 0 &&
+            (replyProtocol !== "3" ||
+                handles.length > MAX_MEDIA_FILES ||
+                new Set(handles).size !== handles.length)
+        ) {
+            throw new HttpError(400, "Protocol 3 requires 1 to 4 unique attachment handles.");
+        }
 
         // What a stranger wrote in an issue, a comment, or a fork's PR is not for Pi, unless the hook's person said
         // anyone: a post they started is dropped, and their words in any other post are left out.
@@ -924,7 +1042,7 @@ export class Hooks {
 
         const delivery = header(post, "x-github-delivery") ?? header(post, "idempotency-key");
         // The hook request is authenticated before `deliver` runs. This capability applies only to a new root receipt.
-        const followUp = header(post, "x-pocket-reply-protocol") === "2";
+        const followUp = replyProtocol === "2" || replyProtocol === "3";
 
         if (
             hook.reply !== undefined &&
@@ -940,11 +1058,53 @@ export class Hooks {
         );
         let sent = false;
 
+        if (handles.length > 0 && hook.reply === undefined) {
+            throw new HttpError(409, "Attachments require a hook with signed replies.");
+        }
+
+        const bodyHash = createHash("sha256").update(post.body).digest("hex");
+        const manifestFingerprint = createHash("sha256")
+            .update(handles.join("\u0000"))
+            .digest("hex");
+        let media: NonNullable<Hook["media"]>[string][] = [];
+
+        // This is the root receipt boundary. It records the exact body and consumes every handle in the same
+        // durable transaction, before submission admission can start.
         await app.harness.commit(async (tx) => {
             sent = (await tx.submissionByRequest(target, requestFor(person.id, key))) !== undefined;
             const item = (await tx.doc(HooksDoc)).items[hook.id];
 
-            if (item?.reply !== undefined) {
+            if (item === undefined || item.target !== Number(target)) {
+                throw new HttpError(404, "Not found");
+            }
+
+            media = handles
+                .map((handle) => item.media?.[handle])
+                .filter(
+                    (value): value is NonNullable<Hook["media"]>[string] => value !== undefined,
+                );
+
+            if (
+                media.length !== handles.length ||
+                media.some(
+                    (file) =>
+                        file.request !== request ||
+                        file.target !== item.target ||
+                        (file.boundRequest !== undefined && file.boundRequest !== request) ||
+                        (file.bodyHash !== undefined && file.bodyHash !== bodyHash),
+                )
+            ) {
+                throw new HttpError(409, "Attachment handle is unavailable");
+            }
+
+            // Stored records are untrusted durable data. Revalidate their descriptor before any receipt or admission.
+            const total = media.reduce((size, file) => size + descriptor(file.file).size, 0);
+
+            if (total > MAX_MEDIA_TOTAL) {
+                throw new HttpError(400, "Attachments exceed 40 MiB.");
+            }
+
+            if (item.reply !== undefined) {
                 item.reply.requests ??= {};
                 const receipts = item.reply.requests;
 
@@ -961,12 +1121,41 @@ export class Hooks {
                     throw new HttpError(429, "Too many replies are pending for this webhook.");
                 }
 
+                const receipt = receipts[key];
+
+                if (
+                    receipt !== undefined &&
+                    ((receipt.bodyHash !== undefined && receipt.bodyHash !== bodyHash) ||
+                        (receipt.attachments !== undefined &&
+                            receipt.attachments.fingerprint !== manifestFingerprint))
+                ) {
+                    throw new HttpError(
+                        409,
+                        "This delivery conflicts with its original body or attachments.",
+                    );
+                }
+
                 receipts[key] ??= {
                     request,
                     submissionRequest: requestFor(person.id, key),
+                    bodyHash,
+                    ...(handles.length === 0
+                        ? {}
+                        : {
+                              attachments: {
+                                  handles: [...handles],
+                                  fingerprint: manifestFingerprint,
+                              },
+                          }),
                     ...(sent ? { done: true } : {}),
                     ...(followUp && !sent ? { followUp: true as const } : {}),
+                    ...(replyProtocol === "3" && !sent ? { protocol: 3 as const } : {}),
                 };
+            }
+
+            for (const file of media) {
+                file.boundRequest = request;
+                file.bodyHash = bodyHash;
             }
         }, context);
 
@@ -990,7 +1179,16 @@ export class Hooks {
             await app.commands.submit(
                 target,
                 person,
-                { text, requestId: key },
+                {
+                    text,
+                    requestId: key,
+                    attachments: media.map((item) => ({
+                        path: item!.path,
+                        name: item!.file.name,
+                        mime: item!.file.mime,
+                        size: item!.file.size,
+                    })),
+                },
                 `webhook ${label(hook.name)}`,
             );
         } catch (error) {

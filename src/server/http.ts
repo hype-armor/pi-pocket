@@ -65,7 +65,7 @@ export function createHandler(options: HttpOptions) {
 
             // Webhooks: posts from other services, let in by the hook's secret, not by a sign-in.
             if (parts[0] === "hook" && parts[1] !== undefined) {
-                return await hookRoute(app, request, response, parts[1], parts[2]);
+                return await hookRoute(app, request, response, parts[1], parts[2], parts[3]);
             }
 
             // An artifact published to anyone with its address: the token is the whole of the access, no sign-in.
