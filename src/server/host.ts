@@ -157,6 +157,8 @@ export interface ApprovalRequest {
     createdAt: number;
     /** Who Pi was working for when the call asked: set by `Approvals`, not by the asker. */
     requestedBy?: string;
+    /** Only the owner may allow this call. Anyone who can steer may still deny it. */
+    ownerOnly?: true;
     /**
      * A question for a person instead of a call to allow (`host.ask`): what the card asks, and its fields. Only the
      * person Pi works for answers it; anyone who can steer can decline it. Its values go to the asker, never here.
@@ -168,7 +170,12 @@ export interface ApprovalRequest {
 export type AskForm = { title: string; text?: string; fields: AskField[]; submit: string };
 
 /** The answer to an approval; an ask's also carries what the person typed, which no one else sees. */
-export type ApprovalAnswer = { allow: boolean; by: string; values?: Record<string, string> };
+export type ApprovalAnswer = {
+    allow: boolean;
+    by: string;
+    values?: Record<string, string>;
+    /** Core attestation for an explicit owner-only file approval. */ ownerId?: string;
+};
 
 /** An answer to pick on an ask's card (`AskField.choices`): a button with its label, and a line under it. */
 export interface AskChoice {
@@ -617,10 +624,42 @@ export type WebAccess = "owner" | "steer" | "view";
 
 export type WebMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
+/** Input for an owner-created session with one private signed reply hook. */
+export interface ProvisionReplySessionRequest {
+    /** Stable within this owner and module. A changed input for this operation is refused. */
+    operation: string;
+    cwd: string;
+    title?: string;
+    /** Exact `provider/model` value from `availableModels()`. */
+    model: string;
+    thinking: ModelThinkingLevel;
+    /** An `http` loopback URL that ends in `/v1/reply`. */
+    replyUrl: string;
+}
+
+/** A private provision result. An extension route must never return `replySecret` to browser code. */
+export interface ProvisionedReplySession {
+    sessionId: number;
+    hook: { id: string; path: string; replySecret: string };
+}
+
 /** A request to a module's route, as its handler gets it. */
 export interface WebRequest {
     /** @experimental @since 0.28.0 */
     createSession(request: { cwd: string; title?: string }): Promise<{ id: number }>;
+    /** Creates a session and one signed reply hook under a durable owner/module/operation receipt. @experimental */
+    provisionReplySession(request: ProvisionReplySessionRequest): Promise<ProvisionedReplySession>;
+    /** Owner-selectable models and supported thinking levels. @experimental */
+    availableModels(): Promise<
+        readonly {
+            provider: string;
+            id: string;
+            name: string;
+            reasoning: boolean;
+            levels: readonly string[];
+            signIn?: true;
+        }[]
+    >;
     readonly method: WebMethod;
     /** The path's `:name` parts, by name. */
     readonly params: Readonly<Record<string, string>>;

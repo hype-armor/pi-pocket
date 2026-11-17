@@ -2282,6 +2282,8 @@ function ApprovalCard({ approval }) {
         server?.approvalRule === "others" &&
         me?.role !== "owner" &&
         approval.requestedBy === me?.id;
+    const ownerOnly = approval.ownerOnly === true && me?.role !== "owner";
+    const cannotAllow = ownCall || ownerOnly;
 
     return html`<div class="approval" data-part="approval">
         <div class="approval-head">
@@ -2296,9 +2298,13 @@ function ApprovalCard({ approval }) {
             !canSteer()
                 ? html`<div class="muted small">Waiting for someone who can steer to answer.</div>`
                 : html`${
-                      ownCall &&
+                      cannotAllow &&
                       html`<div class="muted small">
-                          Someone else has to allow this: it came from your message. You can deny it.
+                          ${
+                              ownerOnly
+                                  ? "Only the owner can allow this file export. You can deny it."
+                                  : "Someone else has to allow this: it came from your message. You can deny it."
+                          }
                       </div>`
                   }
                 <div class="approval-actions">
@@ -2306,7 +2312,7 @@ function ApprovalCard({ approval }) {
                         Deny
                     </button>
                     ${
-                        !ownCall &&
+                        !cannotAllow &&
                         html`<button
                             class="button primary"
                             disabled=${busy}
@@ -3122,7 +3128,8 @@ function canAnswer(approvals) {
             // An ask (`host.ask`) is for the person Pi works for, or the owner when nobody is known.
             approval.form
                 ? (approval.requestedBy ?? owner) === me?.id
-                : !(
+                : !(approval.ownerOnly === true && me?.role !== "owner") &&
+                  !(
                       server?.approvalRule === "others" &&
                       me?.role !== "owner" &&
                       approval.requestedBy === me?.id

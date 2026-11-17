@@ -65,7 +65,7 @@ async function sayAs(user: User, id: ConversationId, text: string): Promise<void
 let calls = 0;
 
 /** Ask for approval of a bash call, as Lancet Guard does. Resolves with the answer. */
-function ask(id: ConversationId, subject: string) {
+function ask(id: ConversationId, subject: string, ownerOnly = false) {
     const request = {
         id: `approval-${++calls}`,
         conversationId: id,
@@ -75,6 +75,7 @@ function ask(id: ConversationId, subject: string) {
         subject,
         reason: "risky",
         createdAt: Date.now(),
+        ...(ownerOnly ? { ownerOnly: true as const } : {}),
     };
 
     return { request, answered: app.approvals.request(request, context) };
@@ -132,6 +133,29 @@ test("with approvals that need someone else, a guest cannot allow a call their o
         "by default anyone who can steer may",
     );
     await fourth.answered;
+});
+
+test("owner-only approvals reject steering guests but still allow their denials", async () => {
+    const alex = app.config.addUser("Owner gate Alex", "guest").user;
+    const id = await newSession(app);
+    const pending = ask(id, "export the approved file", true);
+
+    assert.equal(app.approvals.forConversation(id)[0]?.ownerOnly, true);
+    await assert.rejects(app.answerApproval(pending.request.id, true, alex), {
+        status: 403,
+        message: /Only the owner can allow/,
+    });
+    assert.equal(await app.answerApproval(pending.request.id, false, alex), true);
+    assert.deepEqual(await pending.answered, { allow: false, by: "Owner gate Alex" });
+
+    const allowed = ask(id, "export another approved file", true);
+
+    assert.equal(await app.answerApproval(allowed.request.id, true, owner(app)), true);
+    assert.deepEqual(await allowed.answered, {
+        allow: true,
+        by: owner(app).name,
+        ownerId: owner(app).id,
+    });
 });
 
 test("who asked is fixed when the call asks, a subagent works for whoever its parent worked for, and a resend is the sender's", async () => {

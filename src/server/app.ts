@@ -25,11 +25,14 @@ import {
     type Conversation,
     type ConversationId,
     type Cursor,
+    type TaskId,
     createRegistry,
     defineExtension,
     type DocumentCommitChange,
+    wrapTool,
     hook,
     ToolTask,
+    type ToolRegistration,
     Harness,
     type HarnessSettings,
     LiveDoc,
@@ -44,7 +47,7 @@ import {
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { createCodingTools } from "@earendil-works/pi-durable/tools";
 import { Alerts } from "./alerts.ts";
 import { Attribution, type Missing } from "./attribution.ts";
 import { Browsers } from "./browser.ts";
@@ -70,6 +73,7 @@ import {
     DecisionsDoc,
     FolderFavoritesDoc,
     MemoryDoc,
+    type ReplyOrigins,
     RunFailureDoc,
     type SessionMeta,
     SessionsDoc,
@@ -95,6 +99,7 @@ import {
 } from "./host.ts";
 import { type GuardStatus, LancetGuard } from "./lancet.ts";
 import { takeLock } from "./lock.ts";
+import { boundedReadImages } from "./read-images.ts";
 import { Memory } from "./memory.ts";
 import { isThinkingLevel, modelInfo, modelList, resolveModel, THINKING_LEVELS } from "./models.ts";
 import { Updates } from "./updates.ts";
@@ -107,6 +112,7 @@ import { expandHome, workspaceScheme } from "./paths.ts";
 import { createPublicFetch } from "./public-fetch.ts";
 import { PiSessions } from "./pi-sessions.ts";
 import { Hooks } from "./hooks.ts";
+import { ReplyDelivery, type ReplyReservation } from "./reply-delivery.ts";
 import { Pip, PIP_EXTENSION } from "./pip.ts";
 import { PIP_COMPACT_CHOICES, PipCompaction } from "./pip-compact.ts";
 import { RepoWatches } from "./repo-watches.ts";
@@ -219,6 +225,7 @@ type SessionAsk = {
     subject: string;
     reason: string;
     requestedBy?: string;
+    ownerOnly?: true;
     form?: true;
     at: number;
     count: number;
@@ -426,6 +433,9 @@ export class PocketApp {
     readonly repoWatches = new RepoWatches(this);
     /** Webhooks: addresses other services post to, each a message to a session or PiP (`hooks.ts`). */
     readonly hooks = new Hooks(this);
+    /** Answers that go to webhooks' reply addresses when a run ends (`reply-delivery.ts`). */
+    readonly replies = new ReplyDelivery(this);
+    #stopReplies: (() => void) | undefined;
     /** Lessons Pi keeps across sessions, for a project or everywhere. */
     readonly memory = new Memory(this);
     /** Each person's favorite working folders, shared by their devices. */
@@ -839,7 +849,11 @@ export class PocketApp {
 
         const registry = createRegistry();
 
-        registry.install(CodingTools);
+        // Do not give Durable's read tool an image processor. It passes only already-small
+        // supported bytes through and returns an error diagnostic for every image it would need
+        // to decode, convert, or shrink. Photon work stays in the bounded attachment worker.
+        registry.install(createCodingTools());
+        this.#stopReplies = this.replies.start();
         // Durable work of the app itself, whatever extension modules are on.
         registry.install(
             defineExtension({
@@ -852,6 +866,7 @@ export class PocketApp {
                     this.extensionCommands.task,
                 ],
                 // Values extensions hide (`host.hide`) leave every tool's result before it is stored.
+                wraps: [wrapTool({ name: "read" } as ToolRegistration, boundedReadImages)],
                 hooks: [
                     hook(ToolTask, {
                         afterTool: (_call, result, api) => {
@@ -863,7 +878,40 @@ export class PocketApp {
                 ],
             }),
         );
-        const host: PocketHost = {
+        // These two methods are private compatibility hooks for built-in follow-up producers. They stay out of
+        // `PocketHost`, so drop-ins cannot use hook receipt provenance as an extension API.
+        const host: PocketHost & {
+            readonly replyDeliveryProtocol: 2;
+            replyOriginForTool: (
+                conversationId: ConversationId,
+                taskId: TaskId,
+            ) => Promise<ReplyOrigins | undefined>;
+            reserveReply: (
+                conversationId: ConversationId,
+                request: string,
+                origins: ReplyOrigins | undefined,
+            ) => Promise<ReplyReservation>;
+            replyApprovalControl: (
+                conversationId: ConversationId,
+                taskId: TaskId,
+                file: import("./reply-media.ts").MediaDescriptor,
+                status: "awaiting-file-approval" | "file-approval-resolved",
+            ) => Promise<void>;
+            prepareReplyMedia: (
+                conversationId: ConversationId,
+                taskId: TaskId,
+                callId: string,
+                source: string,
+                mime: string,
+            ) => Promise<{ file: import("./reply-media.ts").MediaDescriptor; path: string }>;
+            registerReplyMedia: (
+                conversationId: ConversationId,
+                taskId: TaskId,
+                callId: string,
+                file: unknown,
+                path: string,
+            ) => Promise<void>;
+        } = {
             guard: this.guard,
             approvals: this.approvals,
             agentDir: getAgentDir(),
@@ -898,6 +946,17 @@ export class PocketApp {
             },
             fetchPublic: createPublicFetch(),
             requesterOf: (conversationId) => this.attribution.requesterOf(conversationId),
+            replyDeliveryProtocol: 2,
+            replyOriginForTool: (conversationId, taskId) =>
+                this.replies.originForTool(conversationId, taskId),
+            reserveReply: (conversationId, request, origin) =>
+                this.replies.reserve(conversationId, request, origin),
+            replyApprovalControl: (conversationId, taskId, file, status) =>
+                this.replies.approvalControl(conversationId, taskId, file, status),
+            prepareReplyMedia: (conversationId, taskId, callId, source, mime) =>
+                this.replies.prepareMedia(conversationId, taskId, callId, source, mime),
+            registerReplyMedia: (conversationId, taskId, callId, file, path) =>
+                this.replies.registerMedia(conversationId, taskId, callId, file, path),
             roleOf: (personId) => this.config.userById(personId)?.role,
             on: (event, listener) => this.events.on(event, listener),
             ask: (request, askContext) => ask(this.approvals, request, askContext),
@@ -2750,6 +2809,7 @@ export class PocketApp {
                 subject: request.subject.slice(0, ASK_SUBJECT),
                 reason: request.reason.slice(0, ASK_REASON),
                 ...(request.requestedBy === undefined ? {} : { requestedBy: request.requestedBy }),
+                ...(request.ownerOnly === true ? { ownerOnly: true as const } : {}),
                 ...(request.form === undefined ? {} : { form: true as const }),
                 at: request.createdAt,
                 count: (kept?.count ?? 0) + 1,
@@ -3066,6 +3126,10 @@ export class PocketApp {
             return "You can view this session but not steer Pi.";
         }
 
+        if (request.ownerOnly === true && user.role !== "owner") {
+            return "Only the owner can allow this call.";
+        }
+
         // An ask (`host.ask`) is answered by the person Pi works for: what it asks for is theirs. With nobody known, the
         // owner answers it. Anyone who can steer can decline it.
         if (request.form !== undefined) {
@@ -3125,6 +3189,9 @@ export class PocketApp {
             !this.approvals.answer(id, {
                 allow,
                 by: user.name,
+                ...(allow && request.ownerOnly === true && user.role === "owner"
+                    ? { ownerId: user.id }
+                    : {}),
                 ...(given === undefined ? {} : { values: given }),
             })
         ) {
@@ -4183,6 +4250,7 @@ export class PocketApp {
             this.#unsubscribeRunEnds?.();
             this.#unsubscribeApprovals?.();
             this.#unsubscribeBrowsers?.();
+            this.#stopReplies?.();
             this.guard.close();
 
             // Modules' cleanups may wait (closing a connection), but not for long: the rest must close too.
