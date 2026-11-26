@@ -34,7 +34,7 @@ jobs:
                   AGENTS.md docs/architecture.md docs/map.md
                   src/server/activity-delivery.ts src/server/app.ts src/server/hooks.ts
                   src/server/http/hook-routes.ts test/activity-delivery.test.ts test/activity-hooks.test.ts
-                  test/extension-ui.test.ts test/mobile-ui.test.ts test/skills.test.ts
+                  test/extension-ui.test.ts test/mobile-ui.test.ts test/pip-board-ui.test.ts test/skills.test.ts
             - name: Focused activity units
               run: node --test --test-concurrency=2 test/activity-delivery.test.ts test/activity-hooks.test.ts
 
@@ -56,6 +56,8 @@ jobs:
                   browser="$(command -v google-chrome)"
                   test -x "$browser"
                   echo "PI_POCKET_BROWSER=$browser" >> "$GITHUB_ENV"
+            - name: Run the PiP Board real Chromium tests
+              run: node --test --test-concurrency=1 test/pip-board-ui.test.ts
             - name: Run every test, including real browser tests
               run: node --test --test-concurrency="$(nproc)" test/*.test.ts
 
@@ -68,7 +70,7 @@ jobs:
             - name: Check the untouched pre-feature source
               uses: actions/checkout@v4
               with:
-                  ref: f5ca14da1ace27c39a7d40681c079dc82d2f682a
+                  ref: 8935f6e18a12f0e01b911695fd8bfbdf0c34e04f
                   persist-credentials: false
             - uses: actions/setup-node@v4
               with:
@@ -80,5 +82,5 @@ jobs:
                   browser="$(command -v google-chrome)"
                   test -x "$browser"
                   echo "PI_POCKET_BROWSER=$browser" >> "$GITHUB_ENV"
-            - name: Compare the two failures without activity changes
-              run: node --test --test-concurrency=1 test/extension-ui.test.ts test/skills.test.ts
+            - name: Compare affected tests without activity changes
+              run: node --test --test-concurrency=1 test/extension-ui.test.ts test/skills.test.ts test/pip-board-ui.test.ts
