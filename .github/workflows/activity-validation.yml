@@ -57,3 +57,27 @@ jobs:
                   echo "PI_POCKET_BROWSER=$browser" >> "$GITHUB_ENV"
             - name: Run every test, including real browser tests
               run: node --test --test-concurrency="$(nproc)" test/*.test.ts
+
+    baseline-control:
+        needs: full-suite
+        if: failure() && needs.full-suite.result == 'failure'
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - name: Check the untouched pre-feature source
+              uses: actions/checkout@v4
+              with:
+                  ref: f5ca14da1ace27c39a7d40681c079dc82d2f682a
+                  persist-credentials: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci --ignore-scripts
+            - name: Require the same real Chromium browser
+              run: |
+                  browser="$(command -v google-chrome)"
+                  test -x "$browser"
+                  echo "PI_POCKET_BROWSER=$browser" >> "$GITHUB_ENV"
+            - name: Compare the two failures without activity changes
+              run: node --test --test-concurrency=1 test/extension-ui.test.ts test/skills.test.ts
