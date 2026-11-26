@@ -2,6 +2,7 @@
 import { type App, cleanUp, newSession, openApp, owner, scriptedModel, until } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { after, before, test } from "node:test";
 import {
@@ -173,6 +174,280 @@ test("fresh authenticated capability binds only its root; failures do not interf
         count,
         "a completed duplicate never resumes activity",
     );
+});
+
+test("protocol 3 media and original activity survive the same HTTP admission", async () => {
+    const { path, hook: stored } = await hook();
+    const request = "media-activity-root";
+    const token = "9".repeat(64);
+    const gate = Promise.withResolvers<void>();
+    const bytes = Buffer.from("private attachment bytes");
+    const descriptor = {
+        id: "a".repeat(64),
+        name: "note.txt",
+        mime: "text/plain",
+        size: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    const uploaded = await fetch(`${pocketUrl}${path}/upload`, {
+        method: "POST",
+        headers: {
+            "idempotency-key": request,
+            "x-pocket-attachment": Buffer.from(JSON.stringify(descriptor)).toString("base64url"),
+        },
+        body: bytes,
+    });
+
+    assert.equal(uploaded.status, 200);
+    const { handle } = (await uploaded.json()) as { handle: string };
+    const body = JSON.stringify({ text: "original", attachments: [{ handle }] });
+    const headers = {
+        "content-type": "application/json",
+        "idempotency-key": request,
+        "x-pocket-reply-protocol": "3",
+        "x-pocket-activity-protocol": "1",
+        "x-pocket-activity-token": token,
+    };
+    const send = (content: string, extra: Record<string, string> = {}) =>
+        fetch(`${pocketUrl}${path}`, {
+            method: "POST",
+            headers: { ...headers, ...extra },
+            body: content,
+        });
+
+    const submit = app.commands.submit;
+    const submissions: Array<Parameters<typeof submit>[2]> = [];
+    let mediaPath = "";
+
+    app.commands.submit = (...args) => {
+        submissions.push(args[2]);
+
+        return submit.apply(app.commands, args);
+    };
+
+    held = gate.promise;
+
+    try {
+        const firstResponse = await send(body);
+
+        assert.equal(firstResponse.status, 202, await firstResponse.text());
+        await until(() => forRequest(request).length > 0, "media root activity");
+        const first = forRequest(request)[0]!;
+        const payload = JSON.parse(first.body) as ActivityPayload;
+
+        assert.equal(payload.token, token);
+        assert.equal(
+            first.signature,
+            signActivity(stored.reply!.secret, first.timestamp, first.body),
+        );
+        assert.equal((await send(body, { "x-pocket-activity-token": "8".repeat(64) })).status, 200);
+        assert.equal(
+            (await send(JSON.stringify({ text: "changed", attachments: [{ handle }] }))).status,
+            409,
+        );
+        const snapshot = await app.harness.snapshot(HooksDoc, BACKGROUND_CONTEXT);
+        const item = snapshot!.items[stored.id]!;
+        const receipt = Object.values(item.reply!.requests!).find(
+            (entry) => entry.request === request,
+        )!;
+
+        assert.equal(receipt.protocol, 3);
+        assert.equal(receipt.followUp, true);
+        assert.deepEqual(receipt.attachments?.handles, [handle]);
+        assert.equal(item.media![handle]!.boundRequest, request);
+        assert.equal(item.media![handle]!.file.sha256, descriptor.sha256);
+        mediaPath = item.media![handle]!.path;
+        assert.equal(submissions.length, 1);
+        assert.deepEqual(submissions[0]!.attachments, [
+            {
+                path: mediaPath,
+                name: descriptor.name,
+                mime: descriptor.mime,
+                size: descriptor.size,
+            },
+        ]);
+        assert.deepEqual(await readFile(mediaPath), bytes);
+        assert.equal(JSON.stringify(snapshot).includes(token), false);
+        assert.ok(forRequest(request).every((entry) => JSON.parse(entry.body).token === token));
+    } finally {
+        app.commands.submit = submit;
+        held = undefined;
+        gate.resolve();
+    }
+
+    await until(() => forRequest(request, "/v1/reply").length === 1, "media root final reply");
+    await until(
+        () => forRequest(request).some((entry) => JSON.parse(entry.body).state === "stopped"),
+        "media root terminal activity",
+    );
+
+    for (const entry of forRequest(request)) {
+        for (const privateValue of [
+            descriptor.name,
+            descriptor.sha256,
+            handle,
+            mediaPath,
+            bytes.toString(),
+            bytes.toString("base64"),
+        ]) {
+            assert.equal(
+                entry.body.includes(privateValue),
+                false,
+                "activity excludes media metadata and bytes",
+            );
+        }
+    }
+});
+
+test("media records are private in hook views", async () => {
+    const { path, hook: stored } = await hook();
+    const bytes = Buffer.from("private file");
+    const file = {
+        id: "b".repeat(64),
+        name: "file.txt",
+        mime: "text/plain",
+        size: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    const result = await fetch(`${pocketUrl}${path}/upload`, {
+        method: "POST",
+        headers: {
+            "idempotency-key": "private-view",
+            "x-pocket-attachment": Buffer.from(JSON.stringify(file)).toString("base64url"),
+        },
+        body: bytes,
+    });
+
+    assert.equal(result.status, 200);
+    const view = (await app.hooks.list(owner(app))).find((item) => item.id === stored.id)!;
+
+    assert.equal("media" in view, false);
+    const snapshot = (await app.harness.snapshot(HooksDoc, BACKGROUND_CONTEXT))!.items[stored.id]!;
+    const managed = app.hooks.view({ ...snapshot, managedReply: true });
+
+    assert.equal("media" in managed, false);
+});
+
+test("protocol 2 accepts ordinary JSON attachments as data", async () => {
+    const { path } = await hook();
+    const response = await fetch(`${pocketUrl}${path}`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            "idempotency-key": "legacy-json",
+            "x-pocket-reply-protocol": "2",
+        },
+        body: JSON.stringify({
+            attachments: [{ url: "https://example.invalid/file" }, { handle: "ordinary-data" }],
+        }),
+    });
+
+    assert.equal(response.status, 202);
+});
+
+test("a legacy receipt cannot acquire new media on a retry", async () => {
+    const { path, hook: stored } = await hook();
+    const request = "legacy-media-retry";
+    const key = clientKey(
+        `hook-${stored.id}-${createHash("sha256").update(request).digest("base64url").slice(0, 32)}`,
+    );
+    const bytes = Buffer.from("private file");
+    const file = {
+        id: "c".repeat(64),
+        name: "file.txt",
+        mime: "text/plain",
+        size: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    const uploaded = await fetch(`${pocketUrl}${path}/upload`, {
+        method: "POST",
+        headers: {
+            "idempotency-key": request,
+            "x-pocket-attachment": Buffer.from(JSON.stringify(file)).toString("base64url"),
+        },
+        body: bytes,
+    });
+    const { handle } = (await uploaded.json()) as { handle: string };
+
+    await app.harness.commit(async (tx) => {
+        const item = (await tx.doc(HooksDoc)).items[stored.id]!;
+
+        item.reply!.requests = {
+            [key]: { request, submissionRequest: requestFor(owner(app).id, key) },
+        };
+    }, BACKGROUND_CONTEXT);
+    const response = await fetch(`${pocketUrl}${path}`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            "idempotency-key": request,
+            "x-pocket-reply-protocol": "3",
+            "x-pocket-activity-protocol": "1",
+            "x-pocket-activity-token": "d".repeat(64),
+        },
+        body: JSON.stringify({ text: "new media", attachments: [{ handle }] }),
+    });
+
+    assert.equal(response.status, 409);
+    const snapshot = await app.harness.snapshot(HooksDoc, BACKGROUND_CONTEXT);
+
+    assert.equal(snapshot!.items[stored.id]!.media![handle]!.boundRequest, undefined);
+    await app.activity.sweep();
+    assert.equal(forRequest(request).length, 0);
+});
+
+test("a durable legacy submission without a receipt cannot bind media on retry", async () => {
+    const { id, path, hook: stored } = await hook();
+    const request = "evicted-legacy-media";
+
+    assert.equal(await post(path, request, { "x-pocket-reply-protocol": "2" }), 202);
+    const key = clientKey(
+        `hook-${stored.id}-${createHash("sha256").update(request).digest("base64url").slice(0, 32)}`,
+    );
+
+    await app.harness.commit(async (tx) => {
+        assert.ok(await tx.submissionByRequest(id, requestFor(owner(app).id, key)));
+        const item = (await tx.doc(HooksDoc)).items[stored.id]!;
+
+        delete item.reply!.requests![key];
+    }, BACKGROUND_CONTEXT);
+    const bytes = Buffer.from("evicted receipt private bytes");
+    const descriptor = {
+        id: "e".repeat(64),
+        name: "evicted.txt",
+        mime: "text/plain",
+        size: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    const uploaded = await fetch(`${pocketUrl}${path}/upload`, {
+        method: "POST",
+        headers: {
+            "idempotency-key": request,
+            "x-pocket-attachment": Buffer.from(JSON.stringify(descriptor)).toString("base64url"),
+        },
+        body: bytes,
+    });
+
+    assert.equal(uploaded.status, 200);
+    const { handle } = (await uploaded.json()) as { handle: string };
+    const response = await fetch(`${pocketUrl}${path}`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            "idempotency-key": request,
+            "x-pocket-reply-protocol": "3",
+            "x-pocket-activity-protocol": "1",
+            "x-pocket-activity-token": "f".repeat(64),
+        },
+        body: JSON.stringify({ text: "new media", attachments: [{ handle }] }),
+    });
+
+    assert.equal(response.status, 409);
+    const snapshot = await app.harness.snapshot(HooksDoc, BACKGROUND_CONTEXT);
+
+    assert.equal(snapshot!.items[stored.id]!.media![handle]!.boundRequest, undefined);
+    await app.activity.sweep();
+    assert.equal(forRequest(request).length, 0);
 });
 
 test("real HTTP activity follows thinking, tool execution, answer work, and completion", async () => {

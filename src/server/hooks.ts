@@ -10,6 +10,8 @@
  * service can reach this server: through a tunnel or a public address. Hooks run while the triggers extension is on.
  */
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
@@ -23,6 +25,15 @@ import { attribute, clip, defang } from "./fence.ts";
 import { BRANCH_EVENTS, canWrite, MAY_WRITE, parseRepo } from "./github.ts";
 import { clientKey, requestFor } from "./requests.ts";
 import { TRIGGERS_EXTENSION } from "./watches.ts";
+import {
+    decodeDescriptor,
+    descriptor,
+    handle as newHandle,
+    hashFile,
+    MAX_MEDIA_FILE,
+    MAX_MEDIA_FILES,
+    MAX_MEDIA_TOTAL,
+} from "./reply-media.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -45,7 +56,7 @@ const DEFAULT_INSTRUCTIONS =
     "Something happened that you were set up to hear about. Say in a line what it is, and whether anything needs doing.";
 
 /** An ordinary hook view retains its reply credential, so the owner can configure its reply receiver. */
-type OrdinaryHookView = Omit<Hook, "secret" | "managedReply" | "reply"> & {
+type OrdinaryHookView = Omit<Hook, "secret" | "managedReply" | "reply" | "media"> & {
     /** Only the stable reply configuration is visible. Durable receipts and answer state stay server-private. */
     reply?: Pick<NonNullable<Hook["reply"]>, "url" | "secret">;
     path: string;
@@ -54,7 +65,7 @@ type OrdinaryHookView = Omit<Hook, "secret" | "managedReply" | "reply"> & {
 };
 
 /** A provisioned hook has private inbound and reply credentials. Browser and generic hook views do not receive them. */
-type ManagedHookView = Omit<Hook, "secret" | "reply"> & {
+type ManagedHookView = Omit<Hook, "secret" | "reply" | "media"> & {
     /** These members stay in the union for older callers, but managed views never emit either field. */
     secret?: never;
     reply?: never;
@@ -428,6 +439,82 @@ export class Hooks {
         return this.#app.loader.extensionNames().includes(TRIGGERS_EXTENSION);
     }
 
+    /** Protocol 3 is available only on unsigned private hook routes. */
+    async capabilities(
+        id: string,
+        secret: string | undefined,
+        headers: Post["headers"],
+    ): Promise<void> {
+        await this.precheck(id, secret, headers);
+    }
+
+    /** Store authenticated protocol-3 bytes before the logical hook post binds them. */
+    async upload(
+        id: string,
+        secret: string | undefined,
+        headers: Post["headers"],
+        request: string | undefined,
+        bytes: Buffer,
+    ): Promise<{ handle: string }> {
+        await this.precheck(id, secret, headers);
+        const attachmentHeader = Array.isArray(headers["x-pocket-attachment"])
+            ? headers["x-pocket-attachment"][0]
+            : headers["x-pocket-attachment"];
+        const file = decodeDescriptor(attachmentHeader);
+
+        if (
+            request === undefined ||
+            request.length === 0 ||
+            request.length > 256 ||
+            bytes.length !== file.size ||
+            hashFile(bytes) !== file.sha256
+        ) {
+            throw new HttpError(400, "Attachment bytes do not match the descriptor");
+        }
+
+        const hook = (await this.#all()).find((each) => each.id === id)!;
+
+        if (hook.signed === true || bytes.length > MAX_MEDIA_FILE) {
+            throw new HttpError(400, "This hook cannot upload attachments");
+        }
+
+        const existing = Object.values(hook.media ?? {}).find(
+            (item) => item.request === request && item.file.id === file.id,
+        );
+
+        if (existing !== undefined) {
+            if (JSON.stringify(existing.file) !== JSON.stringify(file)) {
+                throw new HttpError(409, "Attachment upload conflicts with the existing file");
+            }
+
+            return { handle: existing.handle };
+        }
+
+        const directory = join(
+            this.#app.workspace.uploadDirectory(hook.target as ConversationId),
+            "hook-media",
+        );
+
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        const path = join(directory, `${newHandle()}-${file.name}`);
+
+        await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
+        const issued = newHandle();
+
+        await this.#app.harness.commit(async (tx) => {
+            const current = (await tx.doc(HooksDoc)).items[id];
+
+            if (current === undefined || current.target !== hook.target) {
+                throw new HttpError(404, "Not found");
+            }
+
+            current.media ??= {};
+            current.media[issued] = { handle: issued, request, target: current.target, file, path };
+        }, context);
+
+        return { handle: issued };
+    }
+
     async #all(): Promise<Hook[]> {
         return Object.values((await this.#app.harness.snapshot(HooksDoc, context))?.items ?? {});
     }
@@ -435,13 +522,13 @@ export class Hooks {
     /** A hook as its people see it. */
     view(hook: Hook): HookView {
         if (hook.managedReply === true) {
-            const { secret: _secret, reply: _reply, ...visible } = hook;
+            const { secret: _secret, reply: _reply, media: _media, ...visible } = hook;
 
             // The id helps an owner identify the hook, but this is not its usable unsigned inbound address.
             return { ...visible, path: `/hook/${hook.id}`, managedReply: true };
         }
 
-        const { secret, managedReply: _managedReply, reply, ...rest } = hook;
+        const { secret, managedReply: _managedReply, reply, media: _media, ...rest } = hook;
         const visible = {
             ...rest,
             ...(reply === undefined ? {} : { reply: { url: reply.url, secret: reply.secret } }),
@@ -903,6 +990,47 @@ export class Hooks {
         }
 
         const content = contentOf(post);
+        const replyProtocol = header(post, "x-pocket-reply-protocol");
+        const rawAttachments =
+            content.json !== null &&
+            typeof content.json === "object" &&
+            !Array.isArray(content.json)
+                ? (content.json as { attachments?: unknown }).attachments
+                : undefined;
+        // Protocol 3 accepts opaque handles only. Other JSON remains webhook data.
+        const requestedHandles = replyProtocol === "3" ? rawAttachments : undefined;
+        const legacyHandles =
+            replyProtocol !== "3" && Array.isArray(rawAttachments)
+                ? rawAttachments.flatMap((item: unknown) =>
+                      item !== null &&
+                      typeof item === "object" &&
+                      "handle" in item &&
+                      typeof item.handle === "string"
+                          ? [item.handle]
+                          : [],
+                  )
+                : [];
+        const handles =
+            requestedHandles === undefined
+                ? []
+                : Array.isArray(requestedHandles) &&
+                    requestedHandles.every(
+                        (item) =>
+                            item !== null &&
+                            typeof item === "object" &&
+                            typeof (item as { handle?: unknown }).handle === "string",
+                    )
+                  ? requestedHandles.map((item) => (item as { handle: string }).handle)
+                  : (() => {
+                        throw new HttpError(400, "Attachments must contain upload handles");
+                    })();
+
+        if (
+            handles.length > 0 &&
+            (handles.length > MAX_MEDIA_FILES || new Set(handles).size !== handles.length)
+        ) {
+            throw new HttpError(400, "Protocol 3 requires 1 to 4 unique attachment handles.");
+        }
 
         // What a stranger wrote in an issue, a comment, or a fork's PR is not for Pi, unless the hook's person said
         // anyone: a post they started is dropped, and their words in any other post are left out.
@@ -924,7 +1052,7 @@ export class Hooks {
 
         const delivery = header(post, "x-github-delivery") ?? header(post, "idempotency-key");
         // The hook request is authenticated before `deliver` runs. This capability applies only to a new root receipt.
-        const followUp = header(post, "x-pocket-reply-protocol") === "2";
+        const followUp = replyProtocol === "2" || replyProtocol === "3";
 
         if (
             hook.reply !== undefined &&
@@ -943,11 +1071,58 @@ export class Hooks {
         const activityToken = header(post, "x-pocket-activity-token");
         const activity = header(post, "x-pocket-activity-protocol") === "1";
 
+        if (handles.length > 0 && hook.reply === undefined) {
+            throw new HttpError(409, "Attachments require a hook with signed replies.");
+        }
+
+        const bodyHash = createHash("sha256").update(post.body).digest("hex");
+        const manifestFingerprint = createHash("sha256")
+            .update(handles.join("\u0000"))
+            .digest("hex");
+        let attachments: { path: string; name: string; mime: string; size: number }[] = [];
+
+        // This is the root receipt boundary. It records the exact body and consumes every handle in the same
+        // durable transaction, before submission admission can start.
         await app.harness.commit(async (tx) => {
             sent = (await tx.submissionByRequest(target, requestFor(person.id, key))) !== undefined;
             const item = (await tx.doc(HooksDoc)).items[hook.id];
 
-            if (item?.reply !== undefined) {
+            if (item === undefined || item.target !== Number(target)) {
+                throw new HttpError(404, "Not found");
+            }
+
+            // A legacy post cannot use a handle that this hook issued. Other attachment-shaped JSON stays data.
+            if (legacyHandles.some((handle) => Object.hasOwn(item.media ?? {}, handle))) {
+                throw new HttpError(400, "Protocol 3 is required for attachment handles.");
+            }
+
+            const media = handles
+                .map((handle) => item.media?.[handle])
+                .filter(
+                    (value): value is NonNullable<Hook["media"]>[string] => value !== undefined,
+                );
+
+            if (
+                media.length !== handles.length ||
+                media.some(
+                    (file) =>
+                        file.request !== request ||
+                        file.target !== item.target ||
+                        (file.boundRequest !== undefined && file.boundRequest !== request) ||
+                        (file.bodyHash !== undefined && file.bodyHash !== bodyHash),
+                )
+            ) {
+                throw new HttpError(409, "Attachment handle is unavailable");
+            }
+
+            // Stored records are untrusted durable data. Revalidate their descriptor before any receipt or admission.
+            const total = media.reduce((size, file) => size + descriptor(file.file).size, 0);
+
+            if (total > MAX_MEDIA_TOTAL) {
+                throw new HttpError(400, "Attachments exceed 40 MiB.");
+            }
+
+            if (item.reply !== undefined) {
                 item.reply.requests ??= {};
                 const receipts = item.reply.requests;
 
@@ -965,12 +1140,42 @@ export class Hooks {
                 }
 
                 const fresh = receipts[key] === undefined && !sent;
+                const receipt = receipts[key];
+
+                // A durable submission cannot acquire media after its original receipt is lost or evicted.
+                if (sent && receipt === undefined && handles.length > 0) {
+                    throw new HttpError(409, "This delivery has no original attachment receipt.");
+                }
+
+                if (
+                    receipt !== undefined &&
+                    ((handles.length > 0 &&
+                        (receipt.protocol !== 3 || receipt.attachments === undefined)) ||
+                        (receipt.bodyHash !== undefined && receipt.bodyHash !== bodyHash) ||
+                        (receipt.attachments !== undefined &&
+                            receipt.attachments.fingerprint !== manifestFingerprint))
+                ) {
+                    throw new HttpError(
+                        409,
+                        "This delivery conflicts with its original body or attachments.",
+                    );
+                }
 
                 receipts[key] ??= {
                     request,
                     submissionRequest: requestFor(person.id, key),
+                    bodyHash,
+                    ...(handles.length === 0
+                        ? {}
+                        : {
+                              attachments: {
+                                  handles: [...handles],
+                                  fingerprint: manifestFingerprint,
+                              },
+                          }),
                     ...(sent ? { done: true } : {}),
                     ...(followUp && !sent ? { followUp: true as const } : {}),
+                    ...(replyProtocol === "3" && !sent ? { protocol: 3 as const } : {}),
                 };
 
                 if (fresh && activity && activityToken !== undefined) {
@@ -980,6 +1185,19 @@ export class Hooks {
                     };
                 }
             }
+
+            for (const file of media) {
+                file.boundRequest = request;
+                file.bodyHash = bodyHash;
+            }
+
+            // Transaction document overlays expire on commit. Copy only the validated submission fields.
+            attachments = media.map((item) => ({
+                path: item.path,
+                name: item.file.name,
+                mime: item.file.mime,
+                size: item.file.size,
+            }));
         }, context);
 
         if (sent) {
@@ -1008,7 +1226,11 @@ export class Hooks {
             await app.commands.submit(
                 target,
                 person,
-                { text, requestId: key },
+                {
+                    text,
+                    requestId: key,
+                    attachments,
+                },
                 `webhook ${label(hook.name)}`,
             );
         } catch (error) {

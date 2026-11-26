@@ -5,6 +5,8 @@
  * webhooks answer 503.
  */
 import { obj, opt, str, union } from "@earendil-works/pi-schema";
+import type { MediaDescriptor } from "../reply-media.ts";
+import type { ApprovalAnswer } from "../host.ts";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
 import type { PrWatch } from "../docs.ts";
 import { quoted } from "../fence.ts";
@@ -38,6 +40,28 @@ export function describeWatch(watch: PrWatch): string {
 }
 
 export default function createTriggers(host: PocketHost) {
+    const replyMedia = host as PocketHost & {
+        replyApprovalControl?: (
+            conversationId: Parameters<typeof host.requesterOf>[0],
+            taskId: unknown,
+            file: MediaDescriptor,
+            status: "awaiting-file-approval" | "file-approval-resolved",
+        ) => Promise<void>;
+        prepareReplyMedia?: (
+            conversationId: Parameters<typeof host.requesterOf>[0],
+            taskId: unknown,
+            callId: string,
+            source: string,
+            mime: string,
+        ) => Promise<{ file: MediaDescriptor; path: string }>;
+        registerReplyMedia?: (
+            conversationId: Parameters<typeof host.requesterOf>[0],
+            taskId: unknown,
+            callId: string,
+            file: MediaDescriptor,
+            path: string,
+        ) => Promise<void>;
+    };
     const watchPr = defineTool({
         name: "watch_pr",
         description:
@@ -93,12 +117,100 @@ export default function createTriggers(host: PocketHost) {
         },
     });
 
+    const shareReplyFile = defineTool({
+        name: "share_reply_file",
+        description:
+            "Share one flat export file with the original protocol-3 sender. First write it under .pi-chat-exports/<conversationId>/ in this session's workspace. Give its basename only. Each file is up to 20 MiB; one reply route shares up to 4 files and 40 MiB total. Every file needs owner approval.",
+        parameters: obj({ path: str(), mime: str() }),
+        // Preparation, controls, approval, and registration use durable call memos and idempotent receipts.
+        replay: "safe",
+        execute: async (args, api, context) => {
+            const guard = await host.guard.status();
+
+            if (!guard.available || !guard.enabled) {
+                throw new Error("share_reply_file requires an available enabled Lancet Guard.");
+            }
+
+            if (
+                replyMedia.replyApprovalControl === undefined ||
+                replyMedia.prepareReplyMedia === undefined ||
+                replyMedia.registerReplyMedia === undefined
+            ) {
+                throw new Error("Reply media needs a newer Pocket server.");
+            }
+
+            const memoName = "pocket.reply-media.prepared";
+            let prepared = await api.memo<{ file: MediaDescriptor; path: string }>(
+                memoName,
+                context,
+            );
+
+            if (prepared === undefined) {
+                prepared = await replyMedia.prepareReplyMedia(
+                    api.conversationId,
+                    api.taskId,
+                    api.callId,
+                    args.path,
+                    args.mime,
+                );
+                prepared = await api.memo(memoName, prepared, context);
+            }
+
+            let approval = await api.memo<ApprovalAnswer>("pocket.reply-media.approval", context);
+
+            if (approval === undefined) {
+                await replyMedia.replyApprovalControl(
+                    api.conversationId,
+                    api.taskId,
+                    prepared.file,
+                    "awaiting-file-approval",
+                );
+                approval = await host.approvals.request(
+                    {
+                        id: `${String(api.taskId)}:${api.callId}:reply-media`,
+                        conversationId: api.conversationId,
+                        taskId: api.taskId,
+                        callId: api.callId,
+                        tool: "share_reply_file",
+                        subject: `${prepared.file.name} (${prepared.file.sha256})`,
+                        reason: "This sends the exact private copy to the original chat sender.",
+                        createdAt: Date.now(),
+                        ownerOnly: true,
+                    },
+                    context,
+                );
+                approval = await api.memo("pocket.reply-media.approval", approval, context);
+            }
+
+            await replyMedia.replyApprovalControl(
+                api.conversationId,
+                api.taskId,
+                prepared.file,
+                "file-approval-resolved",
+            );
+
+            if (!approval.allow) {
+                throw new Error("The owner did not approve this file export.");
+            }
+
+            await replyMedia.registerReplyMedia(
+                api.conversationId,
+                api.taskId,
+                api.callId,
+                prepared.file,
+                prepared.path,
+            );
+
+            return reply(`Approved ${prepared.file.name} for the original reply route.`);
+        },
+    });
+
     // A server started before repository watches has none to run: they come with its restart.
     const repoWatches = (host as Partial<PocketHost>).repoWatches;
 
     return defineExtension({
         name: TRIGGERS_EXTENSION,
         tasks: [host.watches.task, ...(repoWatches === undefined ? [] : [repoWatches.task])],
-        tools: [watchPr],
+        tools: [watchPr, shareReplyFile],
     });
 }

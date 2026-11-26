@@ -157,6 +157,8 @@ export interface ApprovalRequest {
     createdAt: number;
     /** Who Pi was working for when the call asked: set by `Approvals`, not by the asker. */
     requestedBy?: string;
+    /** Only the owner may allow this call. Anyone who can steer may still deny it. */
+    ownerOnly?: true;
     /**
      * A question for a person instead of a call to allow (`host.ask`): what the card asks, and its fields. Only the
      * person Pi works for answers it; anyone who can steer can decline it. Its values go to the asker, never here.
@@ -168,7 +170,12 @@ export interface ApprovalRequest {
 export type AskForm = { title: string; text?: string; fields: AskField[]; submit: string };
 
 /** The answer to an approval; an ask's also carries what the person typed, which no one else sees. */
-export type ApprovalAnswer = { allow: boolean; by: string; values?: Record<string, string> };
+export type ApprovalAnswer = {
+    allow: boolean;
+    by: string;
+    values?: Record<string, string>;
+    /** Core attestation for an explicit owner-only file approval. */ ownerId?: string;
+};
 
 /** An answer to pick on an ask's card (`AskField.choices`): a button with its label, and a line under it. */
 export interface AskChoice {
