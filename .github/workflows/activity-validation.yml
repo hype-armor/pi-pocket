@@ -1,0 +1,59 @@
+name: Issue 2 activity validation
+
+# This fork-only feature workflow runs tests. It cannot publish or deploy.
+on:
+    push:
+        branches: [feat/issue-2-activity]
+
+permissions:
+    contents: read
+
+concurrency:
+    group: activity-validation-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    checks:
+        if: github.repository == 'hype-armor/pi-pocket'
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  persist-credentials: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci --ignore-scripts
+            - run: npm run check
+            - run: npm run lint
+            - name: Check formatting of the activity change
+              run: >-
+                  npx prettier --check .github/workflows/activity-validation.yml
+                  AGENTS.md docs/architecture.md docs/map.md
+                  src/server/activity-delivery.ts src/server/app.ts src/server/hooks.ts
+                  src/server/http/hook-routes.ts test/activity-delivery.test.ts test/activity-hooks.test.ts
+            - name: Focused activity units
+              run: node --test --test-concurrency=2 test/activity-delivery.test.ts test/activity-hooks.test.ts
+
+    full-suite:
+        needs: checks
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  persist-credentials: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci --ignore-scripts
+            - name: Require the runner's real Chromium browser
+              run: |
+                  browser="$(command -v google-chrome)"
+                  test -x "$browser"
+                  echo "PI_POCKET_BROWSER=$browser" >> "$GITHUB_ENV"
+            - name: Run every test, including real browser tests
+              run: node --test --test-concurrency="$(nproc)" test/*.test.ts

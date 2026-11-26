@@ -110,6 +110,7 @@ import { createPublicFetch } from "./public-fetch.ts";
 import { PiSessions } from "./pi-sessions.ts";
 import { Hooks } from "./hooks.ts";
 import { ReplyDelivery, type ReplyReservation } from "./reply-delivery.ts";
+import { ActivityDelivery } from "./activity-delivery.ts";
 import { Pip, PIP_EXTENSION } from "./pip.ts";
 import { PIP_COMPACT_CHOICES, PipCompaction } from "./pip-compact.ts";
 import { RepoWatches } from "./repo-watches.ts";
@@ -432,6 +433,9 @@ export class PocketApp {
     /** Answers that go to webhooks' reply addresses when a run ends (`reply-delivery.ts`). */
     readonly replies = new ReplyDelivery(this);
     #stopReplies: (() => void) | undefined;
+    /** Ephemeral activity for authenticated fresh webhook roots. Never resumes after restart. */
+    readonly activity = new ActivityDelivery(this);
+    #stopActivity: (() => void) | undefined;
     /** Lessons Pi keeps across sessions, for a project or everywhere. */
     readonly memory = new Memory(this);
     /** Each person's favorite working folders, shared by their devices. */
@@ -847,6 +851,7 @@ export class PocketApp {
 
         registry.install(CodingTools);
         this.#stopReplies = this.replies.start();
+        this.#stopActivity = this.activity.start();
         // Durable work of the app itself, whatever extension modules are on.
         registry.install(
             defineExtension({
@@ -4209,6 +4214,7 @@ export class PocketApp {
             this.#unsubscribeApprovals?.();
             this.#unsubscribeBrowsers?.();
             this.#stopReplies?.();
+            this.#stopActivity?.();
             this.guard.close();
 
             // Modules' cleanups may wait (closing a connection), but not for long: the rest must close too.

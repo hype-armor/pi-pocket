@@ -211,6 +211,10 @@ Each default-exports `(host: PocketHost, web: ExtensionWeb) => Extension | Exten
 `reply-hooks.ts` owns reply URL rules, signatures, and the payload with its original delivery key.
 `hooks.ts` stores per-post receipts in `HooksDoc` before submission admission.
 `reply-delivery.ts` reads exact submission answers, persists pending payloads, and retries delivery after restart.
+`activity-delivery.ts` separately sends short-lived signed activity for authenticated fresh original roots.
+It keeps capabilities and sequences only in memory, checks exact submission/run membership, and never delays replies.
+`test/activity-delivery.test.ts` covers signatures, leases, safe metadata, queues, binding, failures, and terminal stop.
+`test/activity-hooks.test.ts` checks authenticated capability negotiation and independent final replies over isolated HTTP.
 `test/reply-delivery.test.ts` covers duplicate posts, fast completion, unrelated answers, retries, and restart recovery.
 
 ## Web: `web/` (Preact and htm, no build)
