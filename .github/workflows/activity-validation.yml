@@ -1,0 +1,86 @@
+name: Issue 2 activity validation
+
+# This fork-only feature workflow runs tests. It cannot publish or deploy.
+on:
+    push:
+        branches: [feat/issue-2-activity]
+
+permissions:
+    contents: read
+
+concurrency:
+    group: activity-validation-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    checks:
+        if: github.repository == 'hype-armor/pi-pocket'
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  persist-credentials: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci --ignore-scripts
+            - run: npm run check
+            - run: npm run lint
+            - name: Check formatting of the activity change
+              run: >-
+                  npx prettier --check .github/workflows/activity-validation.yml
+                  AGENTS.md docs/architecture.md docs/map.md
+                  src/server/activity-delivery.ts src/server/app.ts src/server/hooks.ts
+                  src/server/http/hook-routes.ts test/activity-delivery.test.ts test/activity-hooks.test.ts
+                  test/extension-ui.test.ts test/mobile-ui.test.ts test/pip-board-ui.test.ts test/skills.test.ts
+            - name: Focused activity units
+              run: node --test --test-concurrency=2 test/activity-delivery.test.ts test/activity-hooks.test.ts
+
+    full-suite:
+        needs: checks
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  persist-credentials: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci --ignore-scripts
+            - name: Require the runner's real Chromium browser
+              run: |
+                  browser="$(command -v google-chrome)"
+                  test -x "$browser"
+                  echo "PI_POCKET_BROWSER=$browser" >> "$GITHUB_ENV"
+            - name: Run the PiP Board real Chromium tests
+              run: node --test --test-concurrency=1 test/pip-board-ui.test.ts
+            - name: Run every test, including real browser tests
+              run: node --test --test-concurrency="$(nproc)" test/*.test.ts
+
+    baseline-control:
+        needs: full-suite
+        if: failure() && needs.full-suite.result == 'failure'
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - name: Check the untouched pre-feature source
+              uses: actions/checkout@v4
+              with:
+                  ref: 8935f6e18a12f0e01b911695fd8bfbdf0c34e04f
+                  persist-credentials: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci --ignore-scripts
+            - name: Require the same real Chromium browser
+              run: |
+                  browser="$(command -v google-chrome)"
+                  test -x "$browser"
+                  echo "PI_POCKET_BROWSER=$browser" >> "$GITHUB_ENV"
+            - name: Compare affected tests without activity changes
+              run: node --test --test-concurrency=1 test/extension-ui.test.ts test/skills.test.ts test/pip-board-ui.test.ts

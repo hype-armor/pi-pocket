@@ -1033,6 +1033,11 @@ test(
     "Markdown extension points render, update, and remove their registrations",
     real,
     async (t) => {
+        const markdownHas = (selector: string) =>
+            inPage<boolean>(`
+                return JSON.stringify(globalThis.markdownTestHost.querySelector(${JSON.stringify(selector)}) !== null);
+            `);
+
         t.after(() => app.setExtensionEnabled(owner(app), "diagrams.ts", true));
         // Exercise the test renderer, not the built-in renderer that normally takes precedence.
         await app.setExtensionEnabled(owner(app), "diagrams.ts", false);
@@ -1086,6 +1091,20 @@ test(
             "adding Markdown renderers changes the Markdown revision",
         );
 
+        await withMeter(`
+        const { render } = await import("preact");
+        const host = globalThis.markdownTestHost ??= document.createElement("div");
+        const fence = String.fromCharCode(96).repeat(3);
+        const newline = String.fromCharCode(10);
+        const text = [fence + "Pi-Test", "fence-body", fence, "", "$x+y$"].join(newline);
+        document.body.append(host);
+        render(pocket.h(pocket.Markdown, { text }), host);
+        return "null";
+    `);
+        await until(
+            () => markdownHas('code[data-part="inline-math"].math-probe[data-mounted]'),
+            "the custom math renderer mounts",
+        );
         const rendered = await withMeter<{
             source: string | undefined;
             lang: string | undefined;
@@ -1094,14 +1113,7 @@ test(
             mathMounted: boolean;
             mathCustom: boolean;
         }>(`
-        const { render } = await import("preact");
-        const host = globalThis.markdownTestHost ??= document.createElement("div");
-        const fence = String.fromCharCode(96).repeat(3);
-        const newline = String.fromCharCode(10);
-        const text = [fence + "Pi-Test", "fence-body", fence, "", "$x+y$"].join(newline);
-        document.body.append(host);
-        render(pocket.h(pocket.Markdown, { text }), host);
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        const host = globalThis.markdownTestHost;
         const block = host.querySelector("output.fence-probe");
         const math = host.querySelector('code[data-part="inline-math"]');
 
@@ -1124,7 +1136,7 @@ test(
             mathCustom: true,
         });
 
-        const updated = await withMeter<string>(`
+        await withMeter(`
         globalThis.mathHandle.update({
             mount(element, source) {
                 element.classList.add("math-updated");
@@ -1136,7 +1148,13 @@ test(
         const newline = String.fromCharCode(10);
         const text = [fence + "Pi-Test", "fence-body", fence, "", "$x+y$"].join(newline);
         render(pocket.h(pocket.Markdown, { text }), globalThis.markdownTestHost);
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        return "null";
+    `);
+        await until(
+            () => markdownHas('code[data-part="inline-math"].math-updated[data-mounted]'),
+            "the updated math renderer mounts",
+        );
+        const updated = await withMeter<string>(`
         const updated = globalThis.markdownTestHost.querySelector(".math-updated");
 
         return JSON.stringify(updated?.dataset.source ?? null);
@@ -1158,19 +1176,27 @@ test(
             "removing Markdown renderers changes the Markdown revision",
         );
 
-        const fallback = await withMeter<{
-            customFence: boolean;
-            defaultFence: string | undefined;
-            math: boolean;
-            mathMounted: boolean;
-        }>(`
+        await withMeter(`
         const { render } = await import("preact");
         const host = globalThis.markdownTestHost;
         const fence = String.fromCharCode(96).repeat(3);
         const newline = String.fromCharCode(10);
         const text = [fence + "Pi-Test", "fence-body", fence, "", "$x+y$"].join(newline);
         render(pocket.h(pocket.Markdown, { text }), host);
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        return "null";
+    `);
+        await until(
+            async () =>
+                (await markdownHas('code[data-part="inline-math"][data-mounted]')) === before.math,
+            "the previous math renderer is restored",
+        );
+        const fallback = await withMeter<{
+            customFence: boolean;
+            defaultFence: string | undefined;
+            math: boolean;
+            mathMounted: boolean;
+        }>(`
+        const host = globalThis.markdownTestHost;
         const math = host.querySelector('code[data-part="inline-math"]');
 
         return JSON.stringify({

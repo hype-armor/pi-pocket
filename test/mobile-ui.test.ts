@@ -139,7 +139,9 @@ async function fresh(): Promise<void> {
             }
         }
     `);
-    await page.navigate(`${base}/`);
+    const navigation = await page.navigate(`${base}/`);
+
+    assert.equal(navigation.error, undefined, "the fresh phone page navigates successfully");
     await until(
         async () =>
             (await inPage<boolean>(
@@ -228,6 +230,14 @@ async function openWithRows(count: number): Promise<void> {
     `);
 }
 
+test("the top-left Pi button opens the menu on a phone", real, async () => {
+    await fresh();
+    await tap('.home-list .rail-brand[aria-label="Menu"]');
+    await reach({ sheet: "menu", layers: 1, path: "/" }, "the menu from the Pi button");
+    await page.evaluate(`(await import("/store.js")).closeSheet()`);
+    await reach({ sheet: null, layers: 0, path: "/" }, "the closed menu and its history entry");
+});
+
 test("the served SVG icon decodes as an image", real, async () => {
     const [width, height] = await inPage<[number, number]>(`
         const image = new Image();
@@ -239,6 +249,32 @@ test("the served SVG icon decodes as an image", real, async () => {
     `);
 
     assert.ok(width > 0 && height > 0, "the icon has image dimensions");
+});
+
+test("the mobile menu opens without VisualViewport", real, async () => {
+    await fresh();
+    await tap(row(first));
+    await reach({ path: `/s/${first}` }, "the session");
+    await page.evaluate(`
+        Object.defineProperty(window, "visualViewport", { configurable: true, value: undefined });
+    `);
+
+    try {
+        await tap('.topbar [aria-label="Menu"]');
+        await reach(
+            { sheet: "menu", layers: 1, path: `/s/${first}` },
+            "the menu without VisualViewport",
+        );
+    } finally {
+        await page.evaluate(`
+            delete window.visualViewport;
+            (await import("/store.js")).closeSheet();
+        `);
+        await reach(
+            { sheet: null, layers: 0, path: `/s/${first}` },
+            "the closed menu and its history entry",
+        );
+    }
 });
 
 test("back closes the open file, then the Files tile, then leaves the session", real, async () => {

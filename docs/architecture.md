@@ -92,6 +92,34 @@ Webhook edits require steering rights. `Hooks.update` checks creator-or-owner ac
 
 A repository watch (`repo-watches.ts`) is an item of the app-wide `RepoWatchesDoc` and a durable task in the conversation it messages (PiP's, or a session's), with the same wait, look, and send phases as a PR watch: a look puts the message in the task's checkpoint, and the send's request id is the task's and its count's, so it goes once. It reads the repository's issues, pulls, workflow runs, releases, and comments through `gh api`, and keeps the ids it told. PiP's tools (`repo_watch`, `session_watch_pr`, `session_start` with `repo`) act through `Pip` as its person; a repository is worked on or watched only where `gh`'s account can push, and `Pip.checkout` finds a session's checkout whose `origin` is the repository, or clones it once into `repos/`.
 
+### Ephemeral activity from webhooks
+
+`activity-delivery.ts` sends best-effort activity for original webhook requests only.
+An authenticated fresh root must carry `X-Pocket-Activity-Protocol: 1` and a lowercase 64-hex `X-Pocket-Activity-Token`.
+`Hooks.deliver` enrolls the root after it creates its receipt and before it submits the message.
+Duplicate posts cannot enroll a receipt or replace its capability.
+Capabilities and sequences stay in memory. A restart never resumes original activity.
+
+The sender derives `/v1/activity` only when the configured reply URL path equals `/v1/reply`.
+Each signed JSON body binds the hook, original request, token, sequence, expiry, and activity state.
+The HMAC input is `activity-v1.<Unix milliseconds>.<raw body>`, separate from reply signatures.
+Leases last at most 8 seconds, refresh every 3 seconds, and use a 1-second HTTP timeout.
+Activity has no durable outbox or retries. Neither submission nor final reply delivery waits for it.
+One probe reads at most 32 roots in one transaction. A stalled probe queues no additional probes.
+At most 8 callback sends run together. Excess load falls back to lease expiry, without a transport queue.
+Free send slots select the oldest active roots across all batches, then read their current state again.
+A dropped sample does not change the last attempted detail or sequence. No unsent payload enters a transport queue.
+Only the invocation that enrolls a root can refuse it, after Pocket confirms that no submission was admitted.
+The receiver must bind its expected token and reject stale sequences, completed roots, and all events after `stopped`.
+
+Activity reads the exact root submission and its live run, not browser projections or the latest session answer.
+Queued submissions produce no detailed activity until their input belongs to the active run.
+Only the current generation's block kind can produce `thinking`; no thought text leaves Pocket.
+One running tool can produce `using` with a bounded ASCII name, without arguments or output.
+Waits, retries, compaction, parallel tools, and ambiguous tool states produce `working`.
+Completion, cancellation, or a lost capability produces terminal `stopped`; an unreachable receiver expires the lease.
+Derived follow-ups and background work never enroll activity roots.
+
 ### Signed replies from webhooks
 
 The owner can add a reply URL to a webhook. `hooks.ts` stores a receipt before it submits each post.

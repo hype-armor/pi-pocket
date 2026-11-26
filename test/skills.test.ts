@@ -23,9 +23,10 @@ import {
     writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { escape as escapeGlob } from "minimatch";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai/providers/faux";
 import {
@@ -80,8 +81,8 @@ function skill(folder: string, name: string, description = `The ${name} skill.`)
  * place: `.agents/skills` above the repository (never read), in it, and in the session's folder; the project's
  * `.pi/skills`; a folder named in Pi's settings; Pi's `skills/`; and the home folder's `.agents/skills`.
  */
-function fixture() {
-    const base = realpathSync(mkdtempSync(join(root, "skills-")));
+function fixture(prefix = "skills-") {
+    const base = realpathSync(mkdtempSync(join(root, prefix)));
     const own = join(base, "home");
     const agentDir = join(own, ".pi", "agent");
     const outside = join(own, "code");
@@ -210,50 +211,58 @@ test("a session has the skills Pi's CLI has in the same folder, the same one of 
 });
 
 test("the skills setting's exclusions, inclusions, and relative paths work as in Pi's CLI", async () => {
-    const { base, home: own, agentDir, cwd, sources } = fixture();
-    const [theirs, mine, plus] = ["theirs", "mine", "plus"].map((name) => join(base, name)) as [
-        string,
-        string,
-        string,
-    ];
-    const found = (skills: { name: string; filePath: string }[]) =>
-        skills
-            .map(({ name, filePath }) => ({ name, filePath }))
-            .filter((each) => each.name !== "pi-project")
-            .sort((a, b) => a.name.localeCompare(b.name));
+    for (const prefix of ["skills-patterns-", ".skills-patterns-"]) {
+        const { base, home: own, agentDir, cwd, sources } = fixture(prefix);
+        const [theirs, mine, plus] = ["theirs", "mine", "plus"].map((name) => join(base, name)) as [
+            string,
+            string,
+            string,
+        ];
+        const found = (skills: { name: string; filePath: string }[]) =>
+            skills
+                .map(({ name, filePath }) => ({ name, filePath }))
+                .filter((each) => each.name !== "pi-project")
+                .sort((a, b) => a.name.localeCompare(b.name));
 
-    skill(theirs, "teach", "Theirs, taken out by -path.");
-    skill(mine, "teach", "Mine.");
-    skill(plus, "off");
-    skill(plus, "back");
-    skill(join(agentDir, "relative"), "from-agent-dir");
-    skill(join(agentDir, "skills"), "auto-off");
+        skill(theirs, "teach", "Theirs, taken out by -path.");
+        skill(mine, "teach", "Mine.");
+        skill(plus, "off");
+        skill(plus, "back");
+        skill(join(agentDir, "relative"), "from-agent-dir");
+        skill(join(agentDir, "skills"), "auto-off");
 
-    const settingsPaths = [
-        theirs,
-        mine,
-        plus,
-        "relative",
-        `-${join(theirs, "teach")}`,
-        "!**/plus/**",
-        `+${join(plus, "back")}`,
-        "!**/skills/auto-off/**",
-        `-${join(own, ".agents", "skills", "everywhere", "SKILL.md")}`,
-    ];
+        // An anchored glob also matches below hidden temporary parents, which ** does not cross.
+        const plusGlob = escapeGlob(plus.split(sep).join("/"), { windowsPathsNoEscape: true });
+        const settingsPaths = [
+            theirs,
+            mine,
+            plus,
+            "relative",
+            `-${join(theirs, "teach")}`,
+            `!${plusGlob}/**`,
+            `+${join(plus, "back")}`,
+            "!**/skills/auto-off/**",
+            `-${join(own, ".agents", "skills", "everywhere", "SKILL.md")}`,
+        ];
 
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ skills: settingsPaths }));
+        writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ skills: settingsPaths }));
 
-    const ours = found(loadSessionSkills(cwd, { ...sources, settingsPaths }));
+        const ours = found(loadSessionSkills(cwd, { ...sources, settingsPaths }));
 
-    assert.deepEqual(ours, found(await cliSkills(cwd, own, agentDir, false)));
-    // Pi CLI 1.5.2 keeps "off" for this mixed pattern set. The CLI comparison above
-    // remains the compatibility contract for exclusions and explicit paths.
-    assert.deepEqual(
-        ours
-            .map((each) => each.name)
-            .filter((name) => !["pi-user", "from-settings"].includes(name)),
-        ["back", "from-agent-dir", "off", "teach"],
-    );
+        assert.deepEqual(ours, found(await cliSkills(cwd, own, agentDir, false)), prefix);
+        assert.deepEqual(
+            ours
+                .map((each) => each.name)
+                .filter((name) => !["pi-user", "from-settings"].includes(name)),
+            ["back", "from-agent-dir", "teach"],
+            prefix,
+        );
+        assert.equal(
+            ours.find((each) => each.name === "teach")?.filePath,
+            join(mine, "teach", "SKILL.md"),
+            prefix,
+        );
+    }
 });
 
 test("a session lists them as /skill: commands and in its system prompt", async () => {

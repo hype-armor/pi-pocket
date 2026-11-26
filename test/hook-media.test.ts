@@ -92,17 +92,27 @@ test("a root receipt atomically binds matching private handles", async () => {
         uploaded.handle,
         "a lost upload response recovers the same handle",
     );
-    await assert.rejects(
-        app.hooks.deliver(hook.id, {
-            secret: secretOf(hook),
-            headers: { "idempotency-key": "request-1", "x-pocket-reply-protocol": "3" },
-            body: Buffer.from(
-                JSON.stringify({ text: "photo", attachments: [{ handle: uploaded.handle }] }),
-            ),
-        }),
-        HttpError,
-        "the receipt binds before a failed admission",
-    );
+    const submit = app.commands.submit;
+
+    app.commands.submit = async () => {
+        throw new Error("admission interrupted");
+    };
+
+    try {
+        await assert.rejects(
+            app.hooks.deliver(hook.id, {
+                secret: secretOf(hook),
+                headers: { "idempotency-key": "request-1", "x-pocket-reply-protocol": "3" },
+                body: Buffer.from(
+                    JSON.stringify({ text: "photo", attachments: [{ handle: uploaded.handle }] }),
+                ),
+            }),
+            HttpError,
+            "the receipt binds before a failed admission",
+        );
+    } finally {
+        app.commands.submit = submit;
+    }
 
     const stored = await app.harness.snapshot(HooksDoc, BACKGROUND_CONTEXT);
     const item = stored!.items[hook.id]!;
@@ -189,18 +199,18 @@ test("handles fail closed for another hook or original request", async () => {
     await assert.rejects(
         app.hooks.deliver(second.id, {
             secret: secretOf(second),
-            headers: { "idempotency-key": "request-a" },
+            headers: { "idempotency-key": "request-a", "x-pocket-reply-protocol": "3" },
             body: Buffer.from(JSON.stringify({ attachments: [{ handle: uploaded.handle }] })),
         }),
-        HttpError,
+        (error: unknown) => error instanceof HttpError && error.status === 409,
     );
     await assert.rejects(
         app.hooks.deliver(first.id, {
             secret: secretOf(first),
-            headers: { "idempotency-key": "request-b" },
+            headers: { "idempotency-key": "request-b", "x-pocket-reply-protocol": "3" },
             body: Buffer.from(JSON.stringify({ attachments: [{ handle: uploaded.handle }] })),
         }),
-        HttpError,
+        (error: unknown) => error instanceof HttpError && error.status === 409,
     );
 });
 
@@ -242,8 +252,17 @@ test("an interrupted admission leaves the exact root receipt reusable", async ()
         commands.submit = submit;
     }
 
-    await assert.rejects(app.hooks.deliver(hook.id, post), HttpError);
+    commands.submit = async () => {
+        throw new Error("admission interrupted again");
+    };
 
+    try {
+        await assert.rejects(app.hooks.deliver(hook.id, post), HttpError);
+    } finally {
+        commands.submit = submit;
+    }
+
+    assert.equal((await app.hooks.deliver(hook.id, post)).status, 202);
     const stored = await app.harness.snapshot(HooksDoc, BACKGROUND_CONTEXT);
 
     assert.equal(
