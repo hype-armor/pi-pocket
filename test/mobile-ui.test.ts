@@ -139,7 +139,9 @@ async function fresh(): Promise<void> {
             }
         }
     `);
-    await page.navigate(`${base}/`);
+    const navigation = await page.navigate(`${base}/`);
+
+    assert.equal(navigation.error, undefined, "the fresh phone page navigates successfully");
     await until(
         async () =>
             (await inPage<boolean>(
@@ -231,9 +233,9 @@ async function openWithRows(count: number): Promise<void> {
 test("the top-left Pi button opens the menu on a phone", real, async () => {
     await fresh();
     await tap('.home-list .rail-brand[aria-label="Menu"]');
-    await reach({ sheet: "menu" }, "the menu from the Pi button");
+    await reach({ sheet: "menu", layers: 1, path: "/" }, "the menu from the Pi button");
     await page.evaluate(`(await import("/store.js")).closeSheet()`);
-    await reach({ sheet: null }, "the closed menu");
+    await reach({ sheet: null, layers: 0, path: "/" }, "the closed menu and its history entry");
 });
 
 test("the served SVG icon decodes as an image", real, async () => {
@@ -259,13 +261,19 @@ test("the mobile menu opens without VisualViewport", real, async () => {
 
     try {
         await tap('.topbar [aria-label="Menu"]');
-        await reach({ sheet: "menu" }, "the menu without VisualViewport");
+        await reach(
+            { sheet: "menu", layers: 1, path: `/s/${first}` },
+            "the menu without VisualViewport",
+        );
     } finally {
         await page.evaluate(`
             delete window.visualViewport;
             (await import("/store.js")).closeSheet();
         `);
-        await reach({ sheet: null }, "the closed menu");
+        await reach(
+            { sheet: null, layers: 0, path: `/s/${first}` },
+            "the closed menu and its history entry",
+        );
     }
 });
 
