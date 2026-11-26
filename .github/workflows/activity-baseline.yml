@@ -1,0 +1,39 @@
+name: Issue 2 unchanged Mobile baseline
+
+# A read-only diagnostic on a separate test branch. No feature source or test edits.
+on:
+    push:
+        branches: [test/issue-2-pocket-baseline]
+
+permissions:
+    contents: read
+
+concurrency:
+    group: activity-mobile-baseline-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    mobile-baseline:
+        if: github.repository == 'hype-armor/pi-pocket'
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - name: Read the untouched pre-feature source
+              uses: actions/checkout@v4
+              with:
+                  ref: f5ca14da1ace27c39a7d40681c079dc82d2f682a
+                  persist-credentials: false
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: npm
+            - name: Check the unchanged test syntax before browser work
+              run: node --check test/mobile-ui.test.ts
+            - run: npm ci --ignore-scripts
+            - name: Require the runner's real Chromium browser
+              run: |
+                  browser="$(command -v google-chrome)"
+                  test -x "$browser"
+                  echo "PI_POCKET_BROWSER=$browser" >> "$GITHUB_ENV"
+            - name: Run the unchanged Mobile test file
+              run: node --test --test-concurrency=1 test/mobile-ui.test.ts
